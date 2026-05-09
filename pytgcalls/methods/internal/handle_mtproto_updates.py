@@ -14,6 +14,7 @@ from ...types import GroupCallParticipant
 from ...types import RawCallUpdate
 from ...types import Update
 from ...types import UpdatedGroupCallParticipant
+from ._video_sig import video_signature
 
 py_logger = logging.getLogger('pytgcalls')
 
@@ -84,64 +85,79 @@ class HandleMTProtoUpdates(Scaffold):
             async with await self._chat_lock.acquire(chat_id):
                 if chat_id in self._call_sources:
                     call_sources = self._call_sources[chat_id]
-                    was_camera = user_id in call_sources.camera
-                    was_screen = user_id in call_sources.presentation
 
-                    if was_camera != participant.video_camera:
-                        if participant.video_info:
-                            self._call_sources[chat_id].camera[
-                                user_id
-                            ] = participant.video_info.endpoint
-                            try:
-                                await self._binding.add_incoming_video(
-                                    chat_id,
-                                    participant.video_info.endpoint,
-                                    participant.video_info.sources,
-                                )
-                            except (ConnectionNotFound, ConnectionError):
-                                pass
-                        elif user_id in self._call_sources[chat_id].camera:
-                            try:
-                                await self._binding.remove_incoming_video(
-                                    chat_id,
-                                    self._call_sources[
-                                        chat_id
-                                    ].camera[user_id],
-                                )
-                            except (ConnectionNotFound, ConnectionError):
-                                pass
-                            self._call_sources[chat_id].camera.pop(
-                                user_id, None,
-                            )
+                    # Signature-based reconciliation.  See
+                    # ``_video_sig.video_signature`` and
+                    # ``UpdateSources._reconcile_video_kind`` for the full
+                    # rationale; the short version is that the previous
+                    # boolean ``was_camera != participant.video_camera``
+                    # trigger silently skipped re-subscription whenever
+                    # the camera flag stayed True but the underlying
+                    # endpoint or ssrc-groups changed (e.g. republish or
+                    # simulcast renegotiation), causing the affected
+                    # participant's video to freeze for the rest of the
+                    # session even though audio and the participant entry
+                    # itself kept updating normally.
+                    cam_sig = video_signature(participant.video_info)
+                    desired_cam = (
+                        {user_id: (participant.video_info, cam_sig)}
+                        if cam_sig is not None else {}
+                    )
+                    # Limit reconciliation to this single user_id so we
+                    # do not accidentally tear down OTHER users' subs in
+                    # response to one participant's update.  Build a
+                    # filtered view of the cache containing only this
+                    # user's existing entries.
+                    cam_pub_filtered = (
+                        {user_id: call_sources.camera[user_id]}
+                        if user_id in call_sources.camera else {}
+                    )
+                    cam_sig_filtered = (
+                        {user_id: call_sources._camera_sig[user_id]}
+                        if user_id in call_sources._camera_sig else {}
+                    )
+                    await self._reconcile_video_kind(
+                        chat_id,
+                        cam_pub_filtered,
+                        cam_sig_filtered,
+                        desired_cam,
+                    )
+                    # Mirror the filtered changes back to the master
+                    # cache.  ``_reconcile_video_kind`` mutates the dicts
+                    # we passed in lockstep; copy the (possibly absent)
+                    # current value into the master.
+                    if user_id in cam_pub_filtered:
+                        call_sources.camera[user_id] = cam_pub_filtered[user_id]
+                        call_sources._camera_sig[user_id] = cam_sig_filtered[user_id]
+                    else:
+                        call_sources.camera.pop(user_id, None)
+                        call_sources._camera_sig.pop(user_id, None)
 
-                    if was_screen != participant.screen_sharing:
-                        if participant.presentation_info:
-                            self._call_sources[chat_id].presentation[
-                                user_id
-                            ] = participant.presentation_info.endpoint
-                            try:
-                                await self._binding.add_incoming_video(
-                                    chat_id,
-                                    participant.presentation_info.endpoint,
-                                    participant.presentation_info.sources,
-                                )
-                            except (ConnectionNotFound, ConnectionError):
-                                pass
-                        elif user_id in self._call_sources[
-                            chat_id
-                        ].presentation:
-                            try:
-                                await self._binding.remove_incoming_video(
-                                    chat_id,
-                                    self._call_sources[
-                                        chat_id
-                                    ].presentation[user_id],
-                                )
-                            except (ConnectionNotFound, ConnectionError):
-                                pass
-                            self._call_sources[chat_id].presentation.pop(
-                                user_id, None,
-                            )
+                    scr_sig = video_signature(participant.presentation_info)
+                    desired_scr = (
+                        {user_id: (participant.presentation_info, scr_sig)}
+                        if scr_sig is not None else {}
+                    )
+                    scr_pub_filtered = (
+                        {user_id: call_sources.presentation[user_id]}
+                        if user_id in call_sources.presentation else {}
+                    )
+                    scr_sig_filtered = (
+                        {user_id: call_sources._presentation_sig[user_id]}
+                        if user_id in call_sources._presentation_sig else {}
+                    )
+                    await self._reconcile_video_kind(
+                        chat_id,
+                        scr_pub_filtered,
+                        scr_sig_filtered,
+                        desired_scr,
+                    )
+                    if user_id in scr_pub_filtered:
+                        call_sources.presentation[user_id] = scr_pub_filtered[user_id]
+                        call_sources._presentation_sig[user_id] = scr_sig_filtered[user_id]
+                    else:
+                        call_sources.presentation.pop(user_id, None)
+                        call_sources._presentation_sig.pop(user_id, None)
 
             if chat_peer:
                 is_self = BridgedClient.chat_id(

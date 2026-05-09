@@ -11,15 +11,26 @@ class ChatLock:
 
     async def _remove_callback(self, chat_id: int):
         async with self._main_lock:
-            if not self._chat_lock[chat_id].waiters():
+            # Defensive: a concurrent ``acquire`` + drained ``__aexit__``
+            # pair could remove the entry between this callback's
+            # registration and execution.  Use ``.get`` so we never raise
+            # KeyError on a benign race.  Mirrors pytgcalls upstream
+            # PR #319.
+            lock = self._chat_lock.get(chat_id)
+            if lock and not lock.waiters():
                 self._chat_lock.pop(chat_id, None)
 
     async def acquire(self, chat_id: int) -> WaitCounterLock:
         async with self._main_lock:
-            self._chat_lock[chat_id] = self._chat_lock.get(
-                chat_id,
-            ) or WaitCounterLock(
-                self._remove_callback,
-                chat_id,
-            )
-            return self._chat_lock[chat_id]
+            # Cleaner control flow: only construct the WaitCounterLock if
+            # one isn't already cached.  The previous ``get(...) or
+            # WaitCounterLock(...)`` form constructed a discarded lock on
+            # every cache hit.  Mirrors pytgcalls upstream PR #319.
+            lock = self._chat_lock.get(chat_id)
+            if not lock:
+                lock = WaitCounterLock(
+                    self._remove_callback,
+                    chat_id,
+                )
+                self._chat_lock[chat_id] = lock
+            return lock

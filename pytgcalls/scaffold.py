@@ -60,6 +60,15 @@ class Scaffold(HandlersHolder):
     async def _update_sources(self, chat_id: Union[int, str]):
         pass
 
+    async def _reconcile_video_kind(
+        self,
+        chat_id: Union[int, str],
+        public_dict: dict,
+        sig_dict: dict,
+        desired: dict,
+    ):
+        pass
+
     async def _join_presentation(self, chat_id: Union[int, str], join: bool):
         pass
 
